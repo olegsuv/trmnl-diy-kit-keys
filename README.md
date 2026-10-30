@@ -12,6 +12,10 @@ all three keys on the board useful, and fast:
 - **Presses are never lost.** After a press the device spends ~10 s talking to the
   server. A key pressed during that time used to do nothing; now it is remembered and
   handled as soon as the device would otherwise go to sleep.
+- **No fading.** Stock firmware draws new pictures with partial (no-flash) updates.
+  On this panel those pixels are weakly driven: the picture fades and pixels "drop"
+  within the hour. Every new picture now gets one quick flash instead, and every
+  32nd update a full refresh.
 - **Optional built-in Wi-Fi** network, used whenever none is saved, so a Wi-Fi reset
   does not send you back to the captive portal.
 
@@ -84,7 +88,9 @@ never reach devices that already cached a screen with the same data.
 Worth doing with or without this patch. v1.8.18 caches PNGs under their filename and
 forces a full refresh every 8th update. For BMPs it does neither, and draws every BMP
 with a partial update, forever. Ghosting builds up and the panel looks washed out until
-a reset. An 800x480 1-bit grayscale PNG is also ~2-5 KB instead of 48 KB.
+a reset. An 800x480 1-bit grayscale PNG is also ~2-5 KB instead of 48 KB. (With stock
+firmware, `maximum_compatibility: true` forces a full refresh every time - no fading,
+but a triple flash per change.)
 
 ## How it works
 
@@ -97,9 +103,10 @@ a reset. An 800x480 1-bit grayscale PNG is also ~2-5 KB instead of 48 KB.
   Wi-Fi. KEY3 keeps the stock long-press and double-click handling.
 - **`key_cache.cpp`** (new):
   - the flash cache;
-  - redraws: one fast full refresh when switching screens, partial for the same screen;
+  - redraws from flash with one fast refresh;
   - presses latched while the device is awake: the device sleeps for 1 ms and wakes up
     as if that key had woken it.
+- **`display.cpp`**: fast refresh instead of partial, full refresh every 32nd update.
 - **`display_session.cpp`**: hooks the cache into the normal `/api/display` flow.
 - **`parse_response_api_display.cpp`**: parses `key_images`.
 - **`header.cpp`**: sends the `Update-Source` above.

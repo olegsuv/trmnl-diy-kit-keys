@@ -208,15 +208,34 @@ index f539015..40d03f9 100644
      showWakeLogo();
    }
 diff --git a/src/display.cpp b/src/display.cpp
-index aad792f..75e7b8e 100644
+index aad792f..2c44da5 100644
 --- a/src/display.cpp
 +++ b/src/display.cpp
-@@ -1910,6 +1910,10 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait, bool b
+@@ -1906,10 +1906,28 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait, bool b
+         preferences.putUInt(PREFERENCES_TEMP_PROFILE, iTempProfile);
+     }
+ #ifdef BB_EPAPER
+-    if ((iUpdateCount & 7) == 0 || apiDisplayResult.response.maximum_compatibility == true) {
++#ifdef XIAO_EPAPER_KEYS
++    // EE04 kit: every new picture gets a fast (single flash) refresh, so the full
++    // (triple flash) one is only needed now and then to clear what builds up.
++    const int full_every_mask = 31;
++#else
++    const int full_every_mask = 7;
++#endif
++    if ((iUpdateCount & full_every_mask) == 0 || apiDisplayResult.response.maximum_compatibility == true) {
          Log_info("%s [%d]: Forcing full refresh; desired refresh mode was: %d\r\n", __FILE__, __LINE__, iRefreshMode);
          iRefreshMode = REFRESH_FULL; // force full refresh every 8 partials
      }
-+    if (prefer_fast_refresh && iRefreshMode == REFRESH_PARTIAL) {
-+        Log_info("%s [%d]: Another screen: fast refresh instead of partial\r\n", __FILE__, __LINE__);
++#ifdef XIAO_EPAPER_KEYS
++    // Partial updates drive this panel's pixels weakly: the picture fades and
++    // "drops" within the hour. One flash per change instead.
++    const bool no_partial = true;
++#else
++    const bool no_partial = prefer_fast_refresh;
++#endif
++    if (no_partial && iRefreshMode == REFRESH_PARTIAL) {
++        Log_info("%s [%d]: Fast refresh instead of partial\r\n", __FILE__, __LINE__);
 +        iRefreshMode = REFRESH_FAST;
 +    }
      int refresh_seconds = refreshInterval.seconds();
