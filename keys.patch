@@ -1,0 +1,513 @@
+diff --git a/include/config.h b/include/config.h
+index 663d52d..f81d8f0 100644
+--- a/include/config.h
++++ b/include/config.h
+@@ -102,6 +102,17 @@
+ #define FAKE_BATTERY_VOLTAGE
+ #endif
+ 
++#if defined(BOARD_XIAO_EPAPER_DISPLAY)
++// EE04 carrier (TRMNL 7.5" OG DIY Kit): three active-low keys. Stock firmware only
++// uses KEY3 (interrupt_pin); with these the device also wakes on KEY1/KEY2 and
++// tells the server which key it was via Update-Source ("key1".."key3").
++#define XIAO_EPAPER_KEYS 1
++#define PIN_KEY1 2
++#define PIN_KEY2 3
++#define PIN_KEY3 5
++#define XIAO_EPAPER_KEYS_MASK ((1ULL << PIN_KEY1) | (1ULL << PIN_KEY2) | (1ULL << PIN_KEY3))
++#endif
++
+ // DHCP hostname prefix (hyphens instead of spaces).
+ #if defined(PARALLEL_EPD)
+ #define WIFI_CLIENT_HOSTNAME_PREFIX "TRMNL-X"
+diff --git a/include/globals.h b/include/globals.h
+index 7ba4eee..f6e3ede 100644
+--- a/include/globals.h
++++ b/include/globals.h
+@@ -42,6 +42,10 @@ extern bool log_retry;           // need to log connection retry
+ extern uint32_t time_since_sleep;
+ extern float battery_voltage; // read at wake, before the display and WiFi draw current
+ extern esp_sleep_wakeup_cause_t wakeup_reason;
++extern uint8_t wake_key; // 1..3 when an EE04 key woke the device, otherwise 0
++extern bool prefer_fast_refresh;
++extern const char *key_cache_note;
++extern bool key_wake_deferred; // wake_key was pressed while awake and handled on this wake // what the key cache did this wake ("hit", "miss", "bad"), for Update-Source // a different screen is being drawn: no partial update
+ extern SPECIAL_FUNCTION special_function;
+ extern bool special_function_chosen; // picked on the device (TRMNL X touch menu), not the saved one
+ extern int last_wifi_rssi;              // RTC: signal strength (dBm) at the last connection, 0 if unknown
+diff --git a/include/key_cache.h b/include/key_cache.h
+new file mode 100644
+index 0000000..4a13c98
+--- /dev/null
++++ b/include/key_cache.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++// EE04 (TRMNL 7.5" OG DIY Kit) key cache: the server's current image for each of
++// KEY1..KEY3 is kept on flash as /key1.png../key3.png, so a key press redraws its
++// screen straight away, before Wi-Fi is up. See README.md of trmnl-diy-kit-keys.
++
++#include <config.h>
++
++#ifdef XIAO_EPAPER_KEYS
++#include <api_types.h>
++#include <types.h>
++
++// Draws the cached image for `key` (1..3). False when there is none.
++bool key_cache_show(int key);
++
++// After /api/display: shows the current screen (from the cache when it is one of
++// key_images, downloading it first if it changed) and refreshes the other cached
++// screens. Returns false when the response is not for the key cache, and the
++// caller takes its usual path.
++bool key_cache_handle(const ApiDisplayResponse &response, const ApiDisplayInputs &inputs, https_request_err_e *result);
++
++// Keys only wake the device from deep sleep, and a key-cache redraw is quick, so
++// the next key is often pressed while the device is still talking to the server.
++// key_watch_start() latches such presses; key_watch_defer() (just before deep
++// sleep) turns one into an immediate wake-up, and key_watch_resume() (on that
++// wake-up) returns the key so it is handled like a normal key wake.
++void key_watch_start(void);
++bool key_watch_defer(void);
++int key_watch_resume(void);
++#endif
+diff --git a/lib/trmnl/include/api_types.h b/lib/trmnl/include/api_types.h
+index f2d4e2a..6ed785a 100644
+--- a/lib/trmnl/include/api_types.h
++++ b/lib/trmnl/include/api_types.h
+@@ -38,6 +38,9 @@ struct ApiDisplayResponse {
+   bool reset_firmware;
+   SPECIAL_FUNCTION special_function;
+   String action;
++  // BYOS extension for the EE04 key cache: the image of each of KEY1..KEY3.
++  String key_filenames[3];
++  String key_urls[3];
+ };
+ 
+ struct ApiDisplayInputs {
+diff --git a/lib/trmnl/src/parse_response_api_display.cpp b/lib/trmnl/src/parse_response_api_display.cpp
+index 65c3a8f..b87f885 100644
+--- a/lib/trmnl/src/parse_response_api_display.cpp
++++ b/lib/trmnl/src/parse_response_api_display.cpp
+@@ -38,7 +38,7 @@ ApiDisplayResponse parseResponse_apiDisplay(String &payload) {
+     u32TP = 2;
+ //     else if (tp == "c") u32TP = 3;
+ 
+-  return ApiDisplayResponse{
++  ApiDisplayResponse response{
+       .outcome = ApiDisplayOutcome::Ok,
+       .error_detail = "",
+       .status = doc["status"],
+@@ -54,4 +54,10 @@ ApiDisplayResponse parseResponse_apiDisplay(String &payload) {
+       .reset_firmware = doc["reset_firmware"],
+       .special_function = parseSpecialFunction(special_function_str),
+       .action = doc["action"] | ""};
++  JsonArrayConst keys = doc["key_images"].as<JsonArrayConst>();
++  for (size_t i = 0; i < 3 && i < keys.size(); i++) {
++    response.key_filenames[i] = keys[i]["filename"] | "";
++    response.key_urls[i] = keys[i]["image_url"] | "";
++  }
++  return response;
+ }
+diff --git a/lib/wificaptive/src/WifiCaptive.cpp b/lib/wificaptive/src/WifiCaptive.cpp
+index 405ab4e..048ebbd 100644
+--- a/lib/wificaptive/src/WifiCaptive.cpp
++++ b/lib/wificaptive/src/WifiCaptive.cpp
+@@ -371,6 +371,15 @@ void WifiCaptive::readWifiCredentials() {
+     _savedWifis[i].dns2 = preferences.getString(WIFI_STATIC_DNS2_KEY(i), "");
+   }
+ 
++#ifdef WIFI_DEFAULT_SSID
++  // Built-in network (wifi.local, compiled in by build.sh): used while nothing is
++  // saved, so a Wi-Fi reset or an erased NVS does not need the captive portal.
++  if (_savedWifis[0].ssid.isEmpty()) {
++    _savedWifis[0].ssid = WIFI_DEFAULT_SSID;
++    _savedWifis[0].pswd = WIFI_DEFAULT_PASSWORD;
++  }
++#endif
++
+   int idx = preferences.getInt(WIFI_LAST_INDEX, 0);
+   if (idx < 0 || idx >= WIFI_MAX_SAVED_CREDS || _savedWifis[idx].ssid.isEmpty()) idx = 0;
+   _lastIndex = idx;
+diff --git a/src/api-client/header.cpp b/src/api-client/header.cpp
+index cef9af7..0072425 100644
+--- a/src/api-client/header.cpp
++++ b/src/api-client/header.cpp
+@@ -19,6 +19,13 @@ ApiDisplayInputs createApiHeaders() {
+   } else {
+     inputs.updateSource = "unknown";
+   }
++#ifdef XIAO_EPAPER_KEYS
++  // "key2;cache=hit": the key, and what the key cache did before Wi-Fi came up
++  if (wake_key) {
++    inputs.updateSource = "key" + String(wake_key) + (key_cache_note[0] ? ";cache=" : "") + key_cache_note;
++    if (key_wake_deferred) inputs.updateSource += ";deferred";
++  }
++#endif
+ 
+   if (preferences.isKey(PREFERENCES_API_KEY)) {
+     inputs.apiKey = preferences.getString(PREFERENCES_API_KEY, PREFERENCES_API_KEY_DEFAULT);
+diff --git a/src/bl.cpp b/src/bl.cpp
+index f539015..40d03f9 100644
+--- a/src/bl.cpp
++++ b/src/bl.cpp
+@@ -38,6 +38,7 @@
+ #include <refresh_interval.h>
+ #include <services/firmware_update.h>
+ #include <api_response_parsing.h>
++#include <key_cache.h>
+ #include "logging_parcers.h"
+ #include <SPIFFS.h>
+ #include "http_client.h"
+@@ -161,6 +162,22 @@ void bl_init(void)
+                       wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 ||
+                       wakeup_reason == ESP_SLEEP_WAKEUP_EXT1);
+   Log.info("%s [%d]: Wake reason: %d\r\n", __FILE__, __LINE__, (int)wakeup_reason);
++#ifdef XIAO_EPAPER_KEYS
++  int deferred_key = key_watch_resume(); // always consumed, so it cannot fire twice
++  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
++    uint64_t pins = esp_sleep_get_ext1_wakeup_status();
++    wake_key = (pins & (1ULL << PIN_KEY1)) ? 1 : (pins & (1ULL << PIN_KEY2)) ? 2 : (pins & (1ULL << PIN_KEY3)) ? 3 : 0;
++    Log_info("Woken by KEY%d", wake_key);
++  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER && deferred_key != 0) {
++    wake_key = deferred_key;
++    Log_info("KEY%d was pressed during the last wake", wake_key);
++    key_wake_deferred = true;
++  }
++  // Long press (WiFi reset) and double click stay on KEY3, the stock button.
++  bool read_key3 = gpio_wakeup && (wake_key == 0 || wake_key == 3);
++#else
++  bool read_key3 = gpio_wakeup;
++#endif
+ 
+   Log_info("preferences start");
+   bool res = preferences.begin("data", false);
+@@ -176,7 +193,7 @@ void bl_init(void)
+   Log_info("preferences end");
+   #ifndef BOARD_TRMNL_X
+   bool double_click = false;
+-  if (gpio_wakeup)
++  if (read_key3)
+   {
+     Log_info("GPIO wakeup detected (%d)", wakeup_reason);
+     ButtonPressResult button = read_button_presses();
+@@ -231,7 +248,15 @@ void bl_init(void)
+   battery_voltage = battery().readVoltage(); // Read the battery voltage BEFORE WiFi is turned on
+ #endif // BOARD_TRMNL_X
+ 
++#ifdef XIAO_EPAPER_KEYS
++  // A key's screen comes straight from flash; the server is still asked, and
++  // only redraws if that screen changed since it was cached.
++  bool shown_from_cache = wake_key >= 1 && wake_key <= 3 && key_cache_show(wake_key);
++  key_watch_start();
++  if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER && !shown_from_cache)
++#else
+   if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER)
++#endif
+   {
+     showWakeLogo();
+   }
+diff --git a/src/display.cpp b/src/display.cpp
+index aad792f..75e7b8e 100644
+--- a/src/display.cpp
++++ b/src/display.cpp
+@@ -1910,6 +1910,10 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait, bool b
+         Log_info("%s [%d]: Forcing full refresh; desired refresh mode was: %d\r\n", __FILE__, __LINE__, iRefreshMode);
+         iRefreshMode = REFRESH_FULL; // force full refresh every 8 partials
+     }
++    if (prefer_fast_refresh && iRefreshMode == REFRESH_PARTIAL) {
++        Log_info("%s [%d]: Another screen: fast refresh instead of partial\r\n", __FILE__, __LINE__);
++        iRefreshMode = REFRESH_FAST;
++    }
+     int refresh_seconds = refreshInterval.seconds();
+     if (refresh_seconds >= 30*60 && iRefreshMode == REFRESH_PARTIAL) {
+         // For users who set updates 30 minutes or longer, use the "fast" update to prevent ghosting
+diff --git a/src/display_session.cpp b/src/display_session.cpp
+index 2b92f11..3f4745e 100644
+--- a/src/display_session.cpp
++++ b/src/display_session.cpp
+@@ -24,6 +24,7 @@
+ #include <wifi_network.h>
+ 
+ #include "displayed_image.h"
++#include <key_cache.h>
+ 
+ #ifdef BOARD_TRMNL_X
+ #include "touchbar_gesture.h"
+@@ -485,6 +486,15 @@ https_request_err_e downloadAndShow(float batteryVoltage) {
+     return downloadAndShow(batteryVoltage);
+   }
+ 
++#ifdef XIAO_EPAPER_KEYS
++  if (special_function == SF_NONE && apiDisplayResult.response.status == 0 && !reset_firmware &&
++      (result == HTTPS_NO_ERR || result == HTTPS_SUCCESS) &&
++      key_cache_handle(apiDisplayResult.response, apiDisplayInputs, &result)) {
++    status = false;
++    return result;
++  }
++#endif
++
+   if (!status && result == HTTPS_SUCCESS) { // this means we already have this image stored in SPIFFS
+     char szTemp[36];
+     filesystem_fix_filename(apiDisplayResult.response.filename.c_str(), szTemp);
+diff --git a/src/filesystem.cpp b/src/filesystem.cpp
+index cd18994..80f77f4 100644
+--- a/src/filesystem.cpp
++++ b/src/filesystem.cpp
+@@ -127,6 +127,12 @@ void filesystem_purge_old_file(const char *name) {
+     }
+ 
+     s = (char *)file.name();
++#ifdef XIAO_EPAPER_KEYS
++    if (strncmp(s[0] == '/' ? s + 1 : s, "key", 3) == 0) { // the key cache (key_cache.cpp) manages its own files
++      file.close();
++      continue;
++    }
++#endif
+ 
+     timestamp = filesystem_extract_timestamp(s);
+     bDel = false;
+diff --git a/src/globals.cpp b/src/globals.cpp
+index 1794252..0473711 100644
+--- a/src/globals.cpp
++++ b/src/globals.cpp
+@@ -23,6 +23,10 @@ bool log_retry = false;      // need to log connection retry
+ uint32_t time_since_sleep;
+ float battery_voltage;
+ esp_sleep_wakeup_cause_t wakeup_reason = ESP_SLEEP_WAKEUP_UNDEFINED;
++uint8_t wake_key = 0;
++bool prefer_fast_refresh = false;
++const char *key_cache_note = "";
++bool key_wake_deferred = false;
+ SPECIAL_FUNCTION special_function = SF_NONE;
+ bool special_function_chosen = false;
+ RTC_DATA_ATTR int iPrevWakeTime = 0;
+diff --git a/src/key_cache.cpp b/src/key_cache.cpp
+new file mode 100644
+index 0000000..1214c45
+--- /dev/null
++++ b/src/key_cache.cpp
+@@ -0,0 +1,164 @@
++#include <key_cache.h>
++
++#ifdef XIAO_EPAPER_KEYS
++#include <Preferences.h>
++#include <cinttypes>
++#include <api-client/request_headers.h>
++#include <display.h>
++#include <filesystem.h>
++#include <globals.h>
++#include <services/http_retry_request.h>
++#include <trmnl_log.h>
++
++#include "displayed_image.h"
++#include "driver/rtc_io.h"
++
++static const uint8_t PNG_SIGNATURE[8] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
++
++// Which key's screen is on the panel; survives deep sleep, not a power cycle.
++RTC_DATA_ATTR static int shown_key = 0;
++// A key pressed while awake, to be handled right after the coming deep sleep.
++RTC_DATA_ATTR static int deferred_key = 0;
++static volatile int latched_key = 0;
++
++static String cache_path(int key) { return String("/key") + key + ".png"; }
++
++static String name_pref(int key) { return String("kc_name") + key; }
++
++// The server filename the cached file holds, in the SPIFFS-safe form DisplayedImage uses.
++static void fixed_name(const String &filename, char *out) { filesystem_fix_filename(filename.c_str(), out); }
++
++static bool draw_file(int key, const String &filename, bool switching) {
++  uint8_t *buf = nullptr;
++  size_t size = filesystem_read_and_allocate(cache_path(key).c_str(), &buf);
++  if (!buf || size < sizeof(PNG_SIGNATURE) || memcmp(buf, PNG_SIGNATURE, sizeof(PNG_SIGNATURE)) != 0) {
++    Log_info("Key cache: /key%d.png missing or unreadable", key);
++    if (buf) free(buf);
++    filesystem_file_delete(cache_path(key).c_str());
++    preferences.remove(name_pref(key).c_str());
++    return false;
++  }
++  // A different screen replaces everything on the panel; a partial update would
++  // leave the old one ghosted underneath, so that gets one quick flash instead.
++  prefer_fast_refresh = switching;
++  display_show_image(buf, size, true);
++  prefer_fast_refresh = false;
++  free(buf);
++  shown_key = key;
++  char szTemp[36];
++  fixed_name(filename, szTemp);
++  DisplayedImage::remember(szTemp);
++  return true;
++}
++
++bool key_cache_show(int key) {
++  String filename = preferences.getString(name_pref(key).c_str(), "");
++  if (filename.isEmpty() || !filesystem_file_exists(cache_path(key).c_str())) {
++    Log_info("Key cache: nothing cached for KEY%d", key);
++    key_cache_note = "miss";
++    return false;
++  }
++  char szTemp[36];
++  fixed_name(filename, szTemp);
++  if (DisplayedImage::matches(szTemp)) { // e.g. the same key twice
++    Log_info("Key cache: KEY%d is already on the panel", key);
++    key_cache_note = "same";
++    shown_key = key;
++    return true;
++  }
++  Log_info("Key cache: KEY%d -> %s from flash", key, filename.c_str());
++  // No API response yet this wake: keep the saved temperature profile as it is.
++  apiDisplayResult.response.temp_profile = iTempProfile;
++  bool drawn = draw_file(key, filename, true);
++  key_cache_note = drawn ? "hit" : "bad";
++  return drawn;
++}
++
++// Makes /key<key>.png hold `filename`, downloading it when it does not already.
++static bool ensure(int key, const String &filename, const String &url, const ApiDisplayInputs &inputs) {
++  if (preferences.getString(name_pref(key).c_str(), "") == filename && filesystem_file_exists(cache_path(key).c_str()))
++    return true;
++
++  HttpRetryRequestConfig config;
++  config.url = url;
++  config.apiBaseUrl = inputs.baseUrl; // ID / Access-Token only go to the API server
++  config.headers = buildImageHeaders(inputs);
++  HttpRetryRequest request(config);
++  https_request_err_e err = request.execute();
++  if (err != HTTPS_NO_ERR) {
++    Log_info("Key cache: KEY%d download failed - %s", key, https_request_err_str(err));
++    return false;
++  }
++  uint8_t *body = request.body();
++  uint32_t size = request.bodySize();
++  if (size < sizeof(PNG_SIGNATURE) || memcmp(body, PNG_SIGNATURE, sizeof(PNG_SIGNATURE)) != 0) {
++    Log_info("Key cache: KEY%d is not a PNG (%" PRIu32 " bytes), not cached", key, size);
++    return false;
++  }
++  if (filesystem_write_to_file(cache_path(key).c_str(), body, size) != size) {
++    Log_info("Key cache: writing /key%d.png failed", key);
++    filesystem_file_delete(cache_path(key).c_str());
++    preferences.remove(name_pref(key).c_str());
++    return false;
++  }
++  preferences.putString(name_pref(key).c_str(), filename);
++  Log_info("Key cache: KEY%d <- %s (%" PRIu32 " bytes)", key, filename.c_str(), size);
++  return true;
++}
++
++bool key_cache_handle(const ApiDisplayResponse &response, const ApiDisplayInputs &inputs, https_request_err_e *result) {
++  int current = 0;
++  for (int i = 0; i < 3; i++) {
++    if (response.key_filenames[i].length() > 0 && response.key_filenames[i] == response.filename) current = i + 1;
++  }
++  if (current == 0) return false; // stock server, or not one of the key screens
++
++  char szTemp[36];
++  fixed_name(response.filename, szTemp);
++  bool on_panel = DisplayedImage::matches(szTemp);
++
++  // The screen the device should show first, then the rest in the background.
++  if (!ensure(current, response.filename, response.key_urls[current - 1], inputs) && !on_panel) return false;
++  if (on_panel) {
++    Log_info("Key cache: %s is already on the panel", szTemp);
++  } else if (!draw_file(current, response.filename, shown_key != current)) { // another screen: a quick full refresh
++    return false;
++  }
++
++  for (int key = 1; key <= 3; key++) {
++    if (key == current || response.key_filenames[key - 1].isEmpty()) continue;
++    ensure(key, response.key_filenames[key - 1], response.key_urls[key - 1], inputs);
++  }
++  *result = HTTPS_SUCCESS;
++  return true;
++}
++
++static void IRAM_ATTR on_key1(void) { latched_key = 1; }
++static void IRAM_ATTR on_key2(void) { latched_key = 2; }
++static void IRAM_ATTR on_key3(void) { latched_key = 3; }
++
++void key_watch_start(void) {
++  const int pins[3] = {PIN_KEY1, PIN_KEY2, PIN_KEY3};
++  void (*handlers[3])(void) = {on_key1, on_key2, on_key3};
++  for (int i = 0; i < 3; i++) {
++    rtc_gpio_deinit((gpio_num_t)pins[i]); // ext1 left them as RTC pins
++    pinMode(pins[i], INPUT_PULLUP);
++    attachInterrupt(digitalPinToInterrupt(pins[i]), handlers[i], FALLING);
++  }
++}
++
++bool key_watch_defer(void) {
++  int key = latched_key;
++  // The key that woke the device bounces on release; its screen is already shown.
++  if (key == 0 || key == shown_key) return false;
++  Log_info("Key cache: KEY%d pressed while awake, handling it after a 1 ms sleep", key);
++  deferred_key = key;
++  return true;
++}
++
++int key_watch_resume(void) {
++  int key = deferred_key;
++  deferred_key = 0;
++  return key;
++}
++#endif
+diff --git a/src/sleep_session.cpp b/src/sleep_session.cpp
+index 16dc17e..a0f0fcf 100644
+--- a/src/sleep_session.cpp
++++ b/src/sleep_session.cpp
+@@ -17,6 +17,22 @@
+ 
+ #include "driver/gpio.h"
+ 
++#ifdef XIAO_EPAPER_KEYS
++#include "driver/rtc_io.h"
++#include <key_cache.h>
++
++// Wake on any of the three keys. As in ESP-IDF's ext1 example, the internal
++// pull-ups only hold in deep sleep with the RTC peripherals powered.
++static void enableKeyWakeup(void) {
++  esp_sleep_enable_ext1_wakeup(XIAO_EPAPER_KEYS_MASK, ESP_EXT1_WAKEUP_ANY_LOW);
++  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
++  for (gpio_num_t pin : {(gpio_num_t)PIN_KEY1, (gpio_num_t)PIN_KEY2, (gpio_num_t)PIN_KEY3}) {
++    rtc_gpio_pullup_en(pin);
++    rtc_gpio_pulldown_dis(pin);
++  }
++}
++#endif
++
+ #ifdef BOARD_TRMNL_X
+ #include <iqs323_task.h>
+ #include <touchbar_gesture.h>
+@@ -73,6 +89,9 @@ void goToSleep(void) {
+   preferences.putUInt(PREFERENCES_LAST_SLEEP_TIME, systemClock().getTime());
+   preferences.end();
+   esp_sleep_enable_timer_wakeup((uint64_t)time_to_sleep * SLEEP_uS_TO_S_FACTOR);
++#ifdef XIAO_EPAPER_KEYS
++  if (key_watch_defer()) esp_sleep_enable_timer_wakeup(1000); // a key pressed while awake: wake straight up for it
++#endif
+   // Configure GPIO pin for wakeup
+ #if CONFIG_IDF_TARGET_ESP32
+ #define BUTTON_PIN_BITMASK(GPIO) (1ULL << GPIO)  // 2 ^ GPIO_NUMBER in hex
+@@ -81,7 +100,9 @@ void goToSleep(void) {
+   pinMode(pDevice->interrupt_pin, INPUT); // needed to not immediately wake up
+   esp_deep_sleep_enable_gpio_wakeup(1 << pDevice->interrupt_pin, ESP_GPIO_WAKEUP_GPIO_LOW);
+ #elif defined(CONFIG_IDF_TARGET_ESP32S3)
+-#ifdef BOARD_TRMNL_X
++#if defined(XIAO_EPAPER_KEYS)
++  enableKeyWakeup();
++#elif defined(BOARD_TRMNL_X)
+   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_INTERRUPT, 0);
+ #else
+   esp_sleep_enable_ext0_wakeup((gpio_num_t)pDevice->interrupt_pin, 0);
+@@ -131,7 +152,9 @@ void goToSleepButtonOnly(void) {
+ #elif defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C5)
+   esp_deep_sleep_enable_gpio_wakeup(1 << pDevice->interrupt_pin, ESP_GPIO_WAKEUP_GPIO_LOW);
+ #elif CONFIG_IDF_TARGET_ESP32S3
+-#ifdef BOARD_TRMNL_X
++#if defined(XIAO_EPAPER_KEYS)
++  enableKeyWakeup();
++#elif defined(BOARD_TRMNL_X)
+   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_INTERRUPT, 0);
+ #else
+   esp_sleep_enable_ext0_wakeup((gpio_num_t)pDevice->interrupt_pin, 0);

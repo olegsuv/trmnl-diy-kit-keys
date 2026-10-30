@@ -1,0 +1,17 @@
+{
+  "status": 0,
+  "image_url": "https://your-server/api/image/calendar-26c3c86bc4fd.png",
+  "filename": "calendar-26c3c86bc4fd",
+  "refresh_rate": 300,
+  "update_firmware": false,
+  "firmware_url": null,
+  "reset_firmware": false,
+  "special_function": "none",
+  "temperature_profile": "default",
+  "maximum_compatibility": false,
+  "key_images": [
+    { "filename": "464f24b4c67f809d", "image_url": "https://your-server/api/image/464f24b4c67f809d.png" },
+    { "filename": "calendar-26c3c86bc4fd", "image_url": "https://your-server/api/image/calendar-26c3c86bc4fd.png" },
+    { "filename": "radar-d98d1dfa3db3", "image_url": "https://your-server/api/image/radar-d98d1dfa3db3.png" }
+  ]
+}
